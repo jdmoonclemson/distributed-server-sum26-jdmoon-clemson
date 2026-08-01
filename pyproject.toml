@@ -1,0 +1,46 @@
+[project]
+name = "cpsc3600-distributed-server-network"
+version = "0.1.0"
+description = "CPSC 3600 Clemson Relay Chat distributed-server-network project"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    # thread method is cross-platform; signal method fails on Windows.
+    # Thread can't interrupt C-level blocks; the watchdog covers that.
+    # These threaded multi-server scenarios are slow: the 20-scenario
+    # reference run takes >100s, so a single scenario needs generous
+    # headroom. 120s per test is a safe ceiling for the largest
+    # (eleven-server) scenarios.
+    "--timeout=120",
+    "--timeout-method=thread",
+]
+markers = [
+    "bundle: mark test as belonging to a specific grading bundle (usage: @pytest.mark.bundle(1))",
+    "points: mark test with point value for scoring (usage: @pytest.mark.points(10))",
+]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/test_*.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
