@@ -218,26 +218,6 @@ class CRCServer(object):
 
 
     def connect_to_server(self):
-        """ This function is responsible for connecting to a remote CRC server upon starting this server. Each
-        new CRC Server (except for the first one) registers with an existing server on start up. That server 
-        is its entry point into the existing CRC server network.
-        
-        TODO: Create a TCP socket and connect it to the remote server that exists at the following address:
-            (self.connect_to_host_addr, self.connect_to_port)
-        TODO: Register this socket with your selector. 
-        TODO: Send a ServerRegistrationMessage to the server you just connected to. All initial server 
-            registration messages MUST have their last_hop_id set to 0. Rebroadcasts of this message should 
-            contain put the ID of the server that repeated the message in the last_hop_id field as normal.
-
-        NOTE: Even though you know this is a server, it's best to use a BaseConnectionData object for the data
-            parameter to be consistent with how other connections are added. That will get modified when you 
-            get a registration message from the server you just connected to.
-
-        Args:
-            None
-        Returns:
-            None        
-        """
         sock = socket(AF_INET, SOCK_STREAM)
 
         # The target server may not have started listening yet (there's no synchronization
@@ -304,22 +284,7 @@ class CRCServer(object):
 
 
     def cleanup(self):
-        """ This function handles releasing all allocated resources associated with this server (i.e. our 
-        selector and any sockets opened by this server).
-        
-        TODO: Shut down your listening socket
-        TODO: Shut down and unregister all sockets registered with the selector
-        TODO: Shut down the selector
 
-        NOTE: You can get a list of all sockets registered with the selector by accessing a hidden dictionary 
-            of the selector: _fd_to_keys. You can extract a list of io_devices from this using the command: 
-            list(self.sel._fd_to_key.values())
-
-        Args:
-            None
-        Returns:
-            None        
-        """
         for io_device in list(self.sel.get_map().values()):
             sock = cast(socket, io_device.fileobj)
             try:
@@ -339,25 +304,6 @@ class CRCServer(object):
 
 
     def accept_new_connection(self, io_device):
-        """ This function is responsible for handling new connection requests from other servers and from 
-        clients. This function should be called from self.check_IO_devices_for_messages whenever the listening 
-        socket has data that can be read.
-        
-        TODO: Accept the connection request and register it with your selector. All sockets registered here  
-            should be registered for both READ and WRITE events. 
-
-        NOTE: You don't know at this point whether new connection requests are comming from a new server or a  
-            new client (you'll find that out when processing the registration message sent over the connected  
-            socket). As such you don't know whether to use a ServerConncetionData or a ClientConnectionData  
-            object when registering the socket with the selector. Instead, use a BaseConnectionData object so 
-            you have access to a write_buffer. We'll replace this with the appropriate object later when 
-            handling the registration message.
-
-        Args:
-            io_device (...): 
-        Returns:
-            None        
-        """
         listening_sock = cast(socket, io_device.fileobj)
         conn, addr = listening_sock.accept()
         conn.setblocking(False)
