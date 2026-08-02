@@ -15,6 +15,8 @@ from socket import *
 import os
 import selectors
 import logging
+import time
+from typing import cast
 
 ##############################################################################################################
 
@@ -32,6 +34,10 @@ class BaseConnectionData():
     """
     def __init__(self):
         self.write_buffer = b''
+        # True only for the socket a server itself opened via connect_to_server(). Used to avoid a
+        # server re-introducing itself in response to the peer's reciprocal introduction (which
+        # would otherwise create an infinite back-and-forth of registration messages).
+        self.is_outbound_connection = False
 
 class ServerConnectionData(BaseConnectionData):
     """ ServerConnectionData encapsulates data associated with a connection to another server. It derives from
@@ -99,7 +105,7 @@ class CRCServer(object):
         """
 
         # TODO: Create your selector and store it in self.sel
-        self.sel = None
+        self.sel = selectors.DefaultSelector()
 
 
         # The following four variables will be used to track information about the state of the network
@@ -199,7 +205,15 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        self.server_socket = socket(AF_INET, SOCK_STREAM)
+        self.server_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+        self.server_socket.bind(('', self.port))
+        self.server_socket.listen()
+        self.server_socket.setblocking(False)
+
+        # data=None is used as a marker so check_IO_devices_for_messages() can tell the listening
+        # socket apart from every other (server/client) connection socket.
+        self.sel.register(self.server_socket, selectors.EVENT_READ, data=None)
 
 
 
@@ -224,7 +238,28 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        sock = socket(AF_INET, SOCK_STREAM)
+
+        # The target server may not have started listening yet (there's no synchronization
+        # between server startups), so retry the connection for a few seconds before giving up.
+        max_attempts = 50
+        for attempt in range(max_attempts):
+            try:
+                sock.connect((self.connect_to_host_addr, self.connect_to_port))
+                break
+            except (ConnectionRefusedError, OSError):
+                if attempt == max_attempts - 1:
+                    raise
+                time.sleep(0.1)
+
+        sock.setblocking(False)
+
+        data = BaseConnectionData()
+        data.is_outbound_connection = True
+        self.sel.register(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, data=data)
+
+        # All initial (i.e. not-yet-forwarded) server registration messages use last_hop_id=0
+        data.write_buffer += ServerRegistrationMessage.bytes(self.id, 0, self.server_name, self.server_info)
 
 
 
@@ -254,7 +289,17 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        while not self.request_terminate:
+            events = self.sel.select(timeout=0.1)
+            for io_device, event_mask in events:
+                if io_device.data is None:
+                    # This is our listening socket (see the data=None marker set in
+                    # setup_server_socket()).
+                    self.accept_new_connection(io_device)
+                else:
+                    self.handle_io_device_events(io_device, event_mask)
+
+        self.cleanup()
 
 
 
@@ -275,7 +320,21 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        for io_device in list(self.sel.get_map().values()):
+            sock = cast(socket, io_device.fileobj)
+            try:
+                self.sel.unregister(sock)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        try:
+            self.sel.close()
+        except Exception:
+            pass
 
 
 
@@ -299,7 +358,12 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        listening_sock = cast(socket, io_device.fileobj)
+        conn, addr = listening_sock.accept()
+        conn.setblocking(False)
+
+        data = BaseConnectionData()
+        self.sel.register(conn, selectors.EVENT_READ | selectors.EVENT_WRITE, data=data)
 
 
 
@@ -327,7 +391,38 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        sock = cast(socket, io_device.fileobj)
+        data = io_device.data
+
+        if event_mask & selectors.EVENT_READ:
+            try:
+                recv_data = sock.recv(4096)
+            except (ConnectionResetError, ConnectionAbortedError, OSError):
+                recv_data = b''
+
+            if recv_data:
+                self.handle_messages(io_device, recv_data)
+            else:
+                # The remote side closed its end of the connection.
+                try:
+                    self.sel.unregister(sock)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                return
+
+        if event_mask & selectors.EVENT_WRITE:
+            if data is not None and data.write_buffer:
+                try:
+                    sent = sock.send(data.write_buffer)
+                    data.write_buffer = data.write_buffer[sent:]
+                except (BlockingIOError, InterruptedError):
+                    pass
+                except OSError:
+                    pass
 
 
 
@@ -371,7 +466,17 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        if destination_id not in self.hosts_db:
+            return
+        if destination_id in self.adjacent_server_ids or destination_id in self.adjacent_user_ids:
+            # The destination is directly connected to us - write straight to its buffer.
+            self.hosts_db[destination_id].write_buffer += message
+        else:
+            # The destination is further out in the network - forward the message to whichever
+            # adjacent host is the first hop on the path to it.
+            first_link_id = self.hosts_db[destination_id].first_link_id
+            if first_link_id is not None and first_link_id in self.hosts_db:
+                self.hosts_db[first_link_id].write_buffer += message
 
 
 
@@ -397,7 +502,10 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        for server_id in self.adjacent_server_ids:
+            if server_id == ignore_host_id:
+                continue
+            self.send_message_to_host(server_id, message)
 
 
 
@@ -418,7 +526,10 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        for user_id in self.adjacent_user_ids:
+            if user_id == ignore_host_id:
+                continue
+            self.send_message_to_host(user_id, message)
 
 
 
@@ -440,7 +551,7 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        io_device.data.write_buffer += message
 
 ##############################################################################################################
 
@@ -530,7 +641,50 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        if message.source_id in self.hosts_db:
+            status = StatusUpdateMessage.bytes(
+                self.id, 0, 0x02,
+                "A machine has already registered with ID %s" % message.source_id)
+            self.send_message_to_unknown_io_device(io_device, status)
+            return
+
+        is_adjacent = (message.last_hop_id == 0)
+        first_link_id = None if is_adjacent else message.last_hop_id
+
+        conn_data = ClientConnectionData(message.source_id, message.client_name, message.client_info)
+        conn_data.first_link_id = first_link_id
+        self.hosts_db[message.source_id] = conn_data
+
+        if is_adjacent:
+            self.adjacent_user_ids.append(message.source_id)
+
+            if io_device.data is not None:
+                conn_data.write_buffer += io_device.data.write_buffer
+            self.sel.modify(io_device.fileobj, selectors.EVENT_READ | selectors.EVENT_WRITE, conn_data)
+
+            # Welcome the newly-adjacent client.
+            welcome = StatusUpdateMessage.bytes(
+                self.id, message.source_id, 0x00,
+                "Welcome to the Clemson Relay Chat network %s" % message.client_name)
+            self.send_message_to_host(message.source_id, welcome)
+
+            # Tell the newly-adjacent client about every other client we already know about.
+            for hid, hdata in list(self.hosts_db.items()):
+                if hid == message.source_id:
+                    continue
+                if isinstance(hdata, ClientConnectionData):
+                    intro_msg = ClientRegistrationMessage.bytes(hid, self.id, hdata.client_name, hdata.client_info)
+                    self.send_message_to_host(message.source_id, intro_msg)
+
+            # Tell the rest of the network about the new client (but not back to the new client).
+            rebroadcast = ClientRegistrationMessage.bytes(message.source_id, self.id, message.client_name, message.client_info)
+            self.broadcast_message_to_servers(rebroadcast)
+            self.broadcast_message_to_adjacent_clients(rebroadcast, ignore_host_id=message.source_id)
+        else:
+            # This is a forwarded registration - keep passing it along to our other neighbors.
+            rebroadcast = ClientRegistrationMessage.bytes(message.source_id, self.id, message.client_name, message.client_info)
+            self.broadcast_message_to_servers(rebroadcast, ignore_host_id=first_link_id)
+            self.broadcast_message_to_adjacent_clients(rebroadcast, ignore_host_id=first_link_id)
 
 ##############################################################################################################
 
@@ -550,7 +704,10 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        if message.destination_id == self.id or message.destination_id == 0:
+            self.status_updates_log.append(message.content)
+        elif message.destination_id in self.hosts_db:
+            self.send_message_to_host(message.destination_id, message.bytes)
 
 ##############################################################################################################
 
@@ -570,7 +727,13 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        if message.destination_id in self.hosts_db:
+            self.send_message_to_host(message.destination_id, message.bytes)
+        else:
+            error = StatusUpdateMessage.bytes(
+                self.id, message.source_id, 0x01,
+                "Unknown ID %s" % message.destination_id)
+            self.send_message_to_host(message.source_id, error)
 
 ##############################################################################################################
 
@@ -590,7 +753,23 @@ class CRCServer(object):
         Returns:
             None        
         """
-        raise NotImplementedError
+        if message.source_id not in self.hosts_db:
+            return
+
+        # Don't send the quit notice back the way it came: if the client is adjacent to us, that's
+        # the client itself; otherwise it's whichever adjacent host relayed the message to us.
+        conn_data = self.hosts_db[message.source_id]
+        if message.source_id in self.adjacent_user_ids:
+            ignore_id = message.source_id
+        else:
+            ignore_id = conn_data.first_link_id
+
+        self.broadcast_message_to_servers(message.bytes, ignore_host_id=ignore_id)
+        self.broadcast_message_to_adjacent_clients(message.bytes, ignore_host_id=ignore_id)
+
+        del self.hosts_db[message.source_id]
+        if message.source_id in self.adjacent_user_ids:
+            self.adjacent_user_ids.remove(message.source_id)
 
 ##############################################################################################################
 
